@@ -1,0 +1,1 @@
+https://duvad-research.s3.amazonaws.com/pretrained_models/models/seg_model_epoch_100.pkl
