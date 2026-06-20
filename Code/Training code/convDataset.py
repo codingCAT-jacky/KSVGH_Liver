@@ -11,8 +11,60 @@ import torch
 import numpy as np
 
 
+# 建立 Dataset & DataLoader
+with open(PDFF_FILE, 'r') as f:
+    labels_pct = [float(line.strip().replace('%','')) for line in f]  # 0..100
+with open(TAITSI_FILE, 'r') as f:
+    tai_values, tsi_values = [], []  
+    for line in f:
+        elements = line.strip().split()
+        # 1. 轉成 float，2. 不要多包 []
+        tai_row = [float(x) for x in elements[0:5]]
+        tsi_row = [float(x) for x in elements[5:10]]
+        tai_values.append(tai_row) 
+        tsi_values.append(tsi_row) 
+with open(SWE_FILE, 'r') as f:
+    swe_values = []
+    for line in f:
+        swe_row = []
+        elements = line.strip().split()
+        for item in elements:
+            try:
+                num = float(item) # 嘗試轉換為浮點數
+                swe_row.append(num)
+            except ValueError:
+                swe_row = [-1 for i in range(5)]
+                break
+        swe_values.append(swe_row) 
+with open(EZHRI_FILE, 'r') as f:
+    ezhri_values = []
+    for line in f:
+        ezhri_row = []
+        elements = line.strip().split()
+        try:
+            num = float(elements[0]) # 嘗試轉換為浮點數
+            ezhri_row.append(num) #取第一個就好
+        except ValueError:
+            ezhri_row = [-1]
+        ezhri_values.append(ezhri_row) 
+# 將 List 轉成 NumPy Array，這樣後面的減法除法才不會報錯
+tai_values = np.array(tai_values, dtype=np.float32)
+tsi_values = np.array(tsi_values, dtype=np.float32)
+swe_values = np.array(swe_values, dtype=np.float32)
+ezhri_values = np.array(ezhri_values, dtype=np.float32)
+labels_reg  = np.array([v/100.0 for v in labels_pct], dtype=np.float32)   
+labels_cls  = np.array([pdff_to_class(v/100.0) for v in labels_pct], int) 
+N = len(labels_reg)
+print(f"Total folders found: {len(labels_reg)}")
+
+
+# 不分層
+kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+splits = list(kf.split(np.arange(N), y=labels_cls))
+
+
 class imageData:
-    def __init__(self, imgpath, maskpath, value, patient_id=None, tai=None, tsi=None):
+    def __init__(self, imgpath, maskpath, value, patient_id=None, tai=None, tsi=None, swe=None, ezhri=None):
         self.imgpath = imgpath      # 圖片路徑
         self.maskpath = maskpath
         self.value = value    # 對應數值
@@ -20,7 +72,8 @@ class imageData:
         self.patient_id = patient_id  # 新增：紀錄這張圖屬於哪個病人
         self.tai = tai  # 新增：紀錄這張圖的 TAI 值
         self.tsi = tsi  # 新增：紀錄這張圖的 TSI 值
-
+        self.swe = swe if -1 not in swe else None
+        self.ezhri = ezhri if -1 not in ezhri else None
 
 def _sample_gaussian_shadow():
     return GaussianShadow(
@@ -51,20 +104,21 @@ def build_trivial2():
         return (out["image"])
     return _trivial2
 
-def build_imagelist(idx_list, rootimgFolder, rootMaskFolder, labels_reg, tai_values, tsi_values):
+def build_imagelist(idx_list):
     out = []
-    imgfolders = sorted(os.listdir(rootimgFolder))
-    maskfolders = sorted(os.listdir(rootMaskFolder))
+    imgfolders = sorted(os.listdir(IMG_FOLDER))
+    maskfolders = sorted(os.listdir(MASK_FOLDER))
 
     for i in idx_list:
         imgf = imgfolders[i]
         maskf = maskfolders[i]
-        imgfolder_path = os.path.join(rootimgFolder, imgf)
-        maskfolder_path = os.path.join(rootMaskFolder, maskf)
+        imgfolder_path = os.path.join(IMG_FOLDER, imgf)
+        maskfolder_path = os.path.join(MASK_FOLDER, maskf)
         y_reg = float(labels_reg[i])
         tai = tai_values[i]  
         tsi = tsi_values[i]  
-
+        swe = swe_values[i]
+        ezhri = ezhri_values[i]
         for img in sorted(os.listdir(imgfolder_path)):
             if img.lower().endswith('.png'):
                 # 修改這裡：傳入 patient_id=i
@@ -73,7 +127,9 @@ def build_imagelist(idx_list, rootimgFolder, rootMaskFolder, labels_reg, tai_val
                                      y_reg, 
                                      patient_id=i,
                                      tai=tai,
-                                     tsi=tsi))
+                                     tsi=tsi,
+                                     swe=swe,
+                                     ezhri=ezhri))
     return out
 
 trivial2 = build_trivial2()
@@ -90,17 +146,22 @@ base_transform = A.Compose([
 # eng = matlab.engine.start_matlab()
 class PDFFDataset(Dataset):
     def __init__(self, imageDataList, isTrain):
-        self.imageDataList = imageDataList
+        valid = []
+        for imgData in imageDataList:
+            if (imgData.swe is None and NUM_QUS_TYPES>=3) or (imgData.ezhri is None and NUM_QUS_TYPES==4):
+                continue
+            valid.append(imgData)
+        self.dataList = valid
         self.isTrain = isTrain
 
     def __len__(self):
-        return len(self.imageDataList)
+        return len(self.dataList)
 
     def __getitem__(self, idx):
-        img  = cv2.imread(self.imageDataList[idx].imgpath)
+        img  = cv2.imread(self.dataList[idx].imgpath)
         img = img.astype(np.float32) / 255.0
-        # img  = cv2.imread(self.imageDataList[idx].imgpath, cv2.IMREAD_GRAYSCALE)
-        mask = cv2.imread(self.imageDataList[idx].maskpath, cv2.IMREAD_GRAYSCALE)
+        # img  = cv2.imread(self.dataList[idx].imgpath, cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imread(self.dataList[idx].maskpath, cv2.IMREAD_GRAYSCALE)
         mask = np.clip(mask, None, 1)
 
         if self.isTrain:
@@ -109,8 +170,6 @@ class PDFFDataset(Dataset):
 
         # 2) 先在 NumPy 階段做「中心裁切」（安全邊界）
         H, W, _ = img.shape
-        # centerx, centery = W // 2, 370
-        # half_w, half_h   = 200, 200
         centerx, centery = W // 2, H // 2
         half_w, half_h   = 270, 270
         x1 = max(0, centerx - half_w)
@@ -134,36 +193,13 @@ class PDFFDataset(Dataset):
         # out = base_transform(image=img)
         img_t = out["image"]             # torch.Tensor [1,Hc,Wc]
         
-        y = torch.tensor(self.imageDataList[idx].value, dtype=torch.float32)  
-        patient_id = self.imageDataList[idx].patient_id
+        y = torch.tensor(self.dataList[idx].value, dtype=torch.float32)  
+        patient_id = self.dataList[idx].patient_id
 
-        # tai tsi
-        taitsi = torch.tensor(list(self.imageDataList[idx].tai) + list(self.imageDataList[idx].tsi) , dtype=torch.float32)
-        return img_t, y, patient_id, taitsi
+        # QUS
+        taitsi = torch.tensor(list(self.dataList[idx].tai) + list(self.dataList[idx].tsi) , dtype=torch.float32)
+        swe = torch.tensor(list(self.dataList[idx].swe) , dtype=torch.float32) if self.dataList[idx].swe is not None else torch.zeros(5, dtype=torch.float32)
+        ezhri = torch.tensor(list(self.dataList[idx].ezhri) , dtype=torch.float32) if self.dataList[idx].ezhri is not None else torch.zeros(1, dtype=torch.float32)
+        return img_t, y, patient_id, taitsi, swe, ezhri
     
 
-# 建立 Dataset & DataLoader
-with open(PDFF_FILE, 'r') as f:
-    labels_pct = [float(line.strip().replace('%','')) for line in f]  # 0..100
-with open(TAITSI_FILE, 'r') as f:
-    tai_values, tsi_values = [], []  
-    for line in f:
-        elements = line.strip().split()
-        # 1. 轉成 float，2. 不要多包 []
-        tai_row = [float(x) for x in elements[0:5]]
-        tsi_row = [float(x) for x in elements[5:10]]
-        tai_values.append(tai_row) 
-        tsi_values.append(tsi_row) 
-
-# 將 List 轉成 NumPy Array，這樣後面的減法除法才不會報錯
-tai_values = np.array(tai_values, dtype=np.float32)
-tsi_values = np.array(tsi_values, dtype=np.float32)
-labels_reg  = np.array([v/100.0 for v in labels_pct], dtype=np.float32)   
-labels_cls  = np.array([pdff_to_class(v/100.0) for v in labels_pct], int) 
-N = len(labels_reg)
-print(f"Total folders found: {len(labels_reg)}")
-
-
-# 不分層
-kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-splits = list(kf.split(np.arange(N), y=labels_cls))

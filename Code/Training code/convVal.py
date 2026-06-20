@@ -16,14 +16,14 @@ import torch.optim.lr_scheduler as lr_scheduler
 import os
 import torchvision.models as models
 from scipy.stats import pearsonr
+from MedViT import MedViT_small 
 
-
-def create_optimizer(model, requires_grad, T_max):
+def create_optimizer_vgg(model, requires_grad, T_max):
     for param in model.image_extractor.parameters():
         param.requires_grad = requires_grad
     optimizer = optim.AdamW([
         # 老手：步伐極小，只做微調配合
-        {'params': model.image_extractor.parameters(), 'lr': BASE_LR * CONV_LR_FACTOR},
+        {'params': model.image_extractor.parameters(), 'lr': BASE_LR * LR_FACTOR},
         # 其他融合層：步伐調降，進行精細雕琢
         {'params': model.scalar_norm.parameters(), 'lr': BASE_LR},
         {'params': model.fc_features.parameters(), 'lr': BASE_LR},
@@ -32,8 +32,114 @@ def create_optimizer(model, requires_grad, T_max):
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=BASE_LR * 1e-2)
     return optimizer, scheduler
 
+def create_optimizer_vgg_attn(model, requires_grad, T_max):
+    for param in model.image_extractor.parameters():
+        param.requires_grad = requires_grad
+    optimizer = optim.AdamW([
+        {'params': model.image_extractor.parameters(), 'lr': BASE_LR * LR_FACTOR},
+        {'params': model.scalar_norm.parameters(), 'lr': BASE_LR},
+        {'params': model.qus_encoders.parameters(),         'lr': BASE_LR},
+        {'params': model.shared_qus_proj.parameters(),      'lr': BASE_LR},
+        {'params': model.cross_attn_img2qus.parameters(), 'lr': BASE_LR},
+        {'params': model.cross_attn_qus2img.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_features.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_decision.parameters(), 'lr': BASE_LR}
+    ], weight_decay=WEIGHT_DECAY)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=BASE_LR * 1e-2)
+    return optimizer, scheduler
 
-def evaluate_patient_level(model, val_loader, criterion, device, mode=MODE_MULTI):
+def create_optimizer_conv(model, requires_grad, T_max):
+    for param in model.image_extractor.parameters():
+        param.requires_grad = requires_grad
+    optimizer = optim.AdamW([
+        # 老手：步伐極小，只做微調配合
+        {'params': model.image_extractor.parameters(), 'lr': BASE_LR * LR_FACTOR},
+        # 其他融合層：步伐調降，進行精細雕琢
+        {'params': model.scalar_norm.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_features.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_decision.parameters(), 'lr': BASE_LR}
+    ], weight_decay=WEIGHT_DECAY)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=BASE_LR * 1e-2)
+    return optimizer, scheduler
+
+def create_optimizer_conv_Attn(model, requires_grad, T_max):
+    for param in model.image_extractor.parameters():
+        param.requires_grad = requires_grad
+    optimizer = optim.AdamW([
+        # 老手：步伐極小，只做微調配合 (ConvNeXt backbone)
+        {'params': model.image_extractor.parameters(), 'lr': BASE_LR * LR_FACTOR},
+        # 其他融合層：步伐調降，進行精細雕琢
+        {'params': model.scalar_norm.parameters(), 'lr': BASE_LR},
+        {'params': model.qus_encoders.parameters(),         'lr': BASE_LR},
+        {'params': model.shared_qus_proj.parameters(),      'lr': BASE_LR},
+        {'params': model.cross_attn_img2qus.parameters(), 'lr': BASE_LR},
+        {'params': model.cross_attn_qus2img.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_features.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_decision.parameters(), 'lr': BASE_LR}
+    ], weight_decay=WEIGHT_DECAY)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=BASE_LR * 1e-2)
+    return optimizer, scheduler
+
+def create_optimizer_med(model, requires_grad, T_max):
+    """
+    MultiModalMed 用的 optimizer。
+    backbone.stem / features / norm 凍結或解凍（預訓練部分）。
+    proj_head 已被換成 Identity，不含可訓練參數，不需列入。
+    """
+    for param in model.backbone.stem.parameters():
+        param.requires_grad = requires_grad
+    for param in model.backbone.features.parameters():
+        param.requires_grad = requires_grad
+    for param in model.backbone.norm.parameters():
+        param.requires_grad = requires_grad
+    backbone_params = (
+        list(model.backbone.stem.parameters()) +
+        list(model.backbone.features.parameters()) +
+        list(model.backbone.norm.parameters())
+    )
+    optimizer = optim.AdamW([
+        {'params': backbone_params,                'lr': BASE_LR * LR_FACTOR},
+        {'params': model.scalar_norm.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_features.parameters(), 'lr': BASE_LR},
+        {'params': model.fc_decision.parameters(), 'lr': BASE_LR},
+    ], weight_decay=WEIGHT_DECAY)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=BASE_LR * 1e-2)
+    return optimizer, scheduler
+
+
+def create_optimizer_med_attn(model, requires_grad, T_max):
+    """
+    MultiModalAttnMed 用的 optimizer。
+    backbone.stem / features / norm 凍結或解凍（預訓練部分）。
+    """
+    for param in model.backbone.stem.parameters():
+        param.requires_grad = requires_grad
+    for param in model.backbone.features.parameters():
+        param.requires_grad = requires_grad
+    for param in model.backbone.norm.parameters():
+        param.requires_grad = requires_grad
+    backbone_params = (
+        list(model.backbone.stem.parameters()) +
+        list(model.backbone.features.parameters()) +
+        list(model.backbone.norm.parameters())
+    )
+    optimizer = optim.AdamW([
+        {'params': backbone_params,                         'lr': BASE_LR * LR_FACTOR},
+        {'params': model.scalar_norm.parameters(),          'lr': BASE_LR},
+        {'params': model.qus_encoders.parameters(),         'lr': BASE_LR},
+        {'params': model.shared_qus_proj.parameters(),      'lr': BASE_LR},
+        {'params': model.cross_attn_img2qus.parameters(),   'lr': BASE_LR},
+        {'params': model.cross_attn_qus2img.parameters(),   'lr': BASE_LR},
+        {'params': model.fc_features.parameters(),          'lr': BASE_LR},
+        {'params': model.fc_decision.parameters(),          'lr': BASE_LR},
+    ], weight_decay=WEIGHT_DECAY)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max, eta_min=BASE_LR * 1e-2)
+    return optimizer, scheduler
+
+
+
+
+def evaluate_patient_level(model, val_loader, criterion, device):
     model.eval()
     
     patient_preds_dict = defaultdict(list)
@@ -42,17 +148,27 @@ def evaluate_patient_level(model, val_loader, criterion, device, mode=MODE_MULTI
     all_img_targets = []
 
     with torch.no_grad():
-        for inputs, targets, patient_ids, taitsi in val_loader:
-            inputs = inputs.to(device)
+        for img, targets, patient_ids, taitsi, swe, ezhri in val_loader:
+            img = img.to(device)
             targets = targets.to(device)
             taitsi = taitsi.to(device)
             
             with torch.amp.autocast('cuda'):
                 # [關鍵] 傳入雙模態資料 (影像, 數值)
-                if mode == MODE_BASE:
-                    outputs = model(inputs)      
-                elif mode == MODE_MULTI:
-                    outputs = model(inputs, taitsi)  
+                if CURRENT_MODE == MODE_BASE:              
+                    outputs = model(img)      # (B,1)
+                elif CURRENT_MODE in [MODE_MULTI, MODE_MULTI_ATTN]:
+                    if NUM_QUS_TYPES == 2:
+                        outputs = model(img, taitsi)      
+                    elif NUM_QUS_TYPES == 3:
+                        swe = swe.to(device)
+                        three_qus = torch.cat([taitsi, swe], dim=1)
+                        outputs = model(img, three_qus)   
+                    elif NUM_QUS_TYPES == 4:
+                        swe = swe.to(device)      
+                        ezhri = ezhri.to(device)      
+                        four_qus = torch.cat([taitsi, swe, ezhri], dim=1)
+                        outputs = model(img, four_qus) 
             
             all_img_preds.append(outputs.float())
             all_img_targets.append(targets.unsqueeze(1).float())
@@ -112,11 +228,11 @@ if __name__ == "__main__":
     train_idx, val_idx = convDataset.splits[0]  
 
     # 1. 讀取資料、建立 Dataset 和 DataLoader
-    train_list = convDataset.build_imagelist(train_idx, IMG_FOLDER, MASK_FOLDER, convDataset.labels_reg, convDataset.tai_values, convDataset.tsi_values)
-    val_list   = convDataset.build_imagelist(val_idx, IMG_FOLDER, MASK_FOLDER, convDataset.labels_reg, convDataset.tai_values, convDataset.tsi_values)
+    train_list = convDataset.build_imagelist(train_idx)
+    val_list   = convDataset.build_imagelist(val_idx)
     train_ds = convDataset.PDFFDataset(train_list, isTrain=True)  # 你的 Dataset
     val_ds   = convDataset.PDFFDataset(val_list, isTrain=False)
-    train_image_targets = [item.pdffClass for item in train_list] 
+    train_image_targets = [item.pdffClass for item in train_ds.dataList] 
     train_image_targets = np.array(train_image_targets)
     unique_classes, counts = np.unique(train_image_targets, return_counts=True)
     class_weight_dict = {}
@@ -134,17 +250,37 @@ if __name__ == "__main__":
 
     # 2. 設定model、訓練參數等
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    mode = MODE_MULTI
-    pretrained_convnext = models.convnext_tiny(weights='DEFAULT')
-    if mode == MODE_BASE:
-        # multi_model = convModel.BaseConv(pretrained_convnext)
-        multi_model = torch.load(CONV_BASE_MODEL_PATH, map_location=device, weights_only=False)
-        optimizer = optim.AdamW(multi_model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
-    else:
-        multi_model = convModel.MultiModalConv(pretrained_convnext, num_scalars=NUM_SCALARS)
-        multi_model.load_state_dict(torch.load(CONV_MULTI_MODEL_PATH, map_location=device))
-        optimizer, scheduler = create_optimizer(multi_model, requires_grad=False, T_max=NUM_EPOCHS)
+
+    
+    if CURRENT_MODEL == MODEL_CONVNEXT:
+        pretrained_convnext = models.convnext_tiny(weights='DEFAULT')
+        if CURRENT_MODE == MODE_BASE:
+            multi_model = convModel.BaseConv(pretrained_convnext)
+        elif CURRENT_MODE == MODE_MULTI:
+            multi_model = convModel.MultiModalConv(pretrained_convnext, num_scalars=NUM_SCALARS)
+        elif CURRENT_MODE == MODE_MULTI_ATTN:
+            multi_model = convModel.MultiModalAttnConv(pretrained_convnext, num_scalars=NUM_SCALARS, num_qus_types=NUM_QUS_TYPES)
+    elif CURRENT_MODEL == MODEL_MEDVIT:
+        pretrained_med = MedViT_small()  # MedViT_small，num_classes=4（原始碼預設）
+        pretrained_med.load_state_dict(torch.load(MEDVIT_LOAD_PRETEAINMODEL_PATH), strict=False)
+        if CURRENT_MODE == MODE_BASE:
+            multi_model = convModel.BaseMed(pretrained_med)
+        elif CURRENT_MODE == MODE_MULTI:
+            multi_model = convModel.MultiModalMed(pretrained_med, num_scalars=NUM_SCALARS)
+        elif CURRENT_MODE == MODE_MULTI_ATTN:
+            multi_model = convModel.MultiModalAttnMed(pretrained_med, num_scalars=NUM_SCALARS, num_qus_types=NUM_QUS_TYPES)
+    elif CURRENT_MODEL == MODEL_VGG:
+        pretrained_vgg = models.vgg16(weights='DEFAULT')  # 有使用預訓練權重
+        if CURRENT_MODE == MODE_BASE:
+            multi_model = convModel.BaseVGG(pretrained_vgg)
+        elif CURRENT_MODE == MODE_MULTI:
+            multi_model = convModel.MultiModalVGG(pretrained_vgg, num_scalars=NUM_SCALARS)
+        elif CURRENT_MODE == MODE_MULTI_ATTN:
+            multi_model = convModel.MultiModalAttnVGG(pretrained_vgg, num_scalars=NUM_SCALARS, num_qus_types=NUM_QUS_TYPES)
+    # 👇 只需要在這裡寫一次 load，它會自動去 utils 抓對應的字典路徑！
+    multi_model.load_state_dict(torch.load(LOAD_MODEL_PATH, map_location=device))
     multi_model = multi_model.to(device)
+    # elif CURRENT_MODEL == MODEL_MEDVIT:
     criterion = nn.MSELoss()
 
 
@@ -152,12 +288,12 @@ if __name__ == "__main__":
     # --- 執行 Training Set 評估 ---
     # print("\n[*] Running evaluation on Training Set...")
     # train_cm, train_mae, train_acc, train_preds, train_targets, train_img_loss, train_pat_loss, train_img_acc, train_img_mae, train_img_cm = evaluate_patient_level(
-    #     multi_model, train_loader, criterion, device, mode=mode
+    #     multi_model, train_loader, criterion, device
     # )
     # --- 執行 Validation Set 評估 ---
     print("[*] Running evaluation on Validation Set...")
     val_cm, val_mae, val_acc, val_preds, val_targets, val_img_loss, val_pat_loss, val_img_acc, val_img_mae, val_img_cm = evaluate_patient_level(
-        multi_model, val_loader, criterion, device, mode=mode
+        multi_model, val_loader, criterion, device
     )
     # 計算 Pearson 相關係數
     # train_r, train_p = pearsonr(train_targets, train_preds)
@@ -241,8 +377,8 @@ if __name__ == "__main__":
     print("="*100)
 
     # 儲存圖片時順便幫你確認路徑存在 (os.makedirs 已補上在 plot 內)
-    plot_confusion_matrix(val_img_cm, ["S0", "S1", "S2", "S3"], title="Val Image-level CM", filename="./picture/convVal_image_cm.png")
-    plot_confusion_matrix(val_cm, ["S0", "S1", "S2", "S3"], title="Val Patient-level CM", filename="./picture/convVal_patient_cm.png")
+    plot_confusion_matrix(val_img_cm, ["S0", "S1", "S2", "S3"], title="Val Image-level CM", filename="./picture/convVal_image_cm.png", save=True)
+    plot_confusion_matrix(val_cm, ["S0", "S1", "S2", "S3"], title="Val Patient-level CM", filename="./picture/convVal_patient_cm.png", save=True)
     plot_bland_altman(val_preds, val_targets, title="Validation Bland-Altman Plot", filename="./picture/convVal_bland_altman.png")
     plot_correlation_scatter(val_preds, val_targets, title="Correlation between Prediction and MRI-PDFF", filename="./picture/convVal_correlation.png")
     print("\n✅ 所有結果輸出完畢，並已存下 Validation 的 Confusion Matrix 圖片！")

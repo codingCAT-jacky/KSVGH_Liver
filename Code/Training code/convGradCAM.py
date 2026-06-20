@@ -1,18 +1,5 @@
 """
-convGradCAM.py  ─  非 Attention 版 Grad-CAM
-支援 MultiModalConv（10 或 20 個 QUS 數字）
-
-典型用法：
-    img_t, img_vis = preprocess_image("path/to/image.png")
-
-    normal_qus  = torch.tensor([...], dtype=torch.float32)   # 10 或 20 個數字
-    extreme_qus = torch.tensor([...], dtype=torch.float32)   # 自行替換
-
-    cam_normal  = compute_gradcam(model, img_t, normal_qus,  device)
-    cam_extreme = compute_gradcam(model, img_t, extreme_qus, device)
-
-    compare_heatmaps(img_vis, cam_normal, cam_extreme,
-                     label_a="Normal QUS", label_b="Extreme QUS")
+convGradCAM.py  ─  支援最新架構的 Grad-CAM (自動適應 VGG/ConvNeXt/MedViT 與多種 QUS 維度)
 """
 
 import os
@@ -26,30 +13,20 @@ from albumentations.pytorch import ToTensorV2
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 import torchvision.models as models
+from MedViT import MedViT_small
 import convModel
-from convModel import MultiModalVGG
 import convDataset
 from convUtils import *
 
-
 # ─────────────────────────────────────────────
-# 1. Regression Target
+# 1. Regression Target & Wrapper
 # ─────────────────────────────────────────────
 class PDFFRegressionTarget:
-    """output: [B, 1]  →  scalar per sample，供 Grad-CAM 反向傳播"""
     def __call__(self, output):
         return output[0]
 
-
-# ─────────────────────────────────────────────
-# 2. MultiModal Wrapper
-#    固定 QUS，只暴露 img 給 pytorch-grad-cam
-# ─────────────────────────────────────────────
 class MultiModalWrapper(nn.Module):
     def __init__(self, model, fixed_qus: torch.Tensor):
-        """
-        fixed_qus : [1, num_scalars]，已在正確 device 上
-        """
         super().__init__()
         self.model = model
         self.fixed_qus = fixed_qus
@@ -57,42 +34,43 @@ class MultiModalWrapper(nn.Module):
     def forward(self, img):
         return self.model(img, self.fixed_qus)
 
-
 # ─────────────────────────────────────────────
-# 3. 取得 Target Layer
-#    ConvNeXt-Tiny features[7] → [B, 768, 7, 7]
+# 2. 智慧尋找 Target Layer
 # ─────────────────────────────────────────────
 def get_target_layer(model):
-    return model.image_extractor.features[7]
-
-
+    """根據不同 Backbone 結構動態尋找最後一個卷積層作為 CAM 的 Target"""
+    if CURRENT_MODEL == MODEL_CONVNEXT:
+        # ConvNeXt 的 features 模組最後一塊
+        return model.image_extractor.features[-1]
+    elif CURRENT_MODEL == MODEL_VGG:
+        # VGG features 的最後一層通常是 MaxPool，我們取倒數第二層 Conv2d (index 28)
+        # 在 MultiModalAttnVGG 中它是放在 image_extractor 中
+        return model.image_extractor[28]
+    elif CURRENT_MODEL == MODEL_MEDVIT:
+        # MedViT 的空間特徵是從 norm 輸出的
+        return model.backbone.norm
+    else:
+        raise ValueError("Unknown Target Layer for Current Model")
 
 # ─────────────────────────────────────────────
-# 4. 影像前處理（與 convDataset.py 完全一致）
+# 3. 影像前處理
 # ─────────────────────────────────────────────
 def preprocess_image(img_path: str):
-    """
-    Returns
-    -------
-    img_tensor : [1, 1, 224, 224]  float32 Tensor（模型輸入）
-    img_vis    : [224, 224, 3]     float32 numpy，值域 [0,1]（疊加熱力圖用）
-    """
     img = cv2.imread(img_path)
     if img is None:
         raise FileNotFoundError(f"Cannot read: {img_path}")
     img = img / 255.0
 
-    # Center crop
     H, W, _ = img.shape
     cx, cy   = W // 2, H // 2
     hw, hh   = 270, 270
     x1, y1   = max(0, cx - hw), max(0, cy - hh)
     x2, y2   = min(W, cx + hw), min(H, cy + hh)
     img      = img[y1:y2, x1:x2, :].astype(np.float32)
-    img01    = img[..., 0]          # 單通道
+    img01    = img[..., 0]          
 
     transform = A.Compose([A.Resize(224, 224), ToTensorV2()])
-    img_tensor = transform(image=img01)["image"].unsqueeze(0).float()  # [1,1,224,224]
+    img_tensor = transform(image=img01)["image"].unsqueeze(0).float()  
 
     img_vis = cv2.resize(img01, (224, 224))
     img_vis = np.stack([img_vis] * 3, axis=-1).astype(np.float32)
@@ -100,127 +78,180 @@ def preprocess_image(img_path: str):
 
     return img_tensor, img_vis
 
-
 # ─────────────────────────────────────────────
-# 5. 計算 Grad-CAM
+# 4. 運算與繪圖邏輯
 # ─────────────────────────────────────────────
-def compute_gradcam(
-    model,
-    img_tensor: torch.Tensor,
-    qus_tensor: torch.Tensor,
-    device: str,
-) -> np.ndarray:
-    """
-    Parameters
-    ----------
-    model      :  MultiModalConv
-    img_tensor : [1, 1, 224, 224]
-    qus_tensor : [num_scalars] 或 [1, num_scalars]
-    device     : 'cuda' 或 'cpu'
-
-    Returns
-    -------
-    cam_map : [224, 224]，float32，值域 [0, 1]
-    """
+def compute_gradcam(model, img_tensor, qus_tensor, device):
     model.eval()
     img_tensor = img_tensor.to(device)
 
-
     if qus_tensor.dim() == 1:
         qus_tensor = qus_tensor.unsqueeze(0)
-    cam_model    = MultiModalWrapper(model, qus_tensor.to(device))
-    cam_model = cam_model.to(device)
-    target_layer = model.image_extractor.features[7]
-
+        
+    cam_model = MultiModalWrapper(model, qus_tensor.to(device)).to(device)
+    target_layer = get_target_layer(model)
 
     cam = GradCAM(model=cam_model, target_layers=[target_layer])
-    targets = [PDFFRegressionTarget()]
-    grayscale_cam = cam(
-        input_tensor=img_tensor,
-        targets=targets
-    )
-    return grayscale_cam[0]   # [224, 224]
+    grayscale_cam = cam(input_tensor=img_tensor, targets=[PDFFRegressionTarget()])
+    return grayscale_cam[0]   
 
+def get_prediction(model, img_tensor, qus_tensor, device):
+    model.eval()
+    with torch.no_grad():
+        img_tensor = img_tensor.to(device)
+        if qus_tensor.dim() == 1:
+            qus_tensor = qus_tensor.unsqueeze(0)
+        pred = model(img_tensor, qus_tensor.to(device)).item()
+    return pred
 
 # ─────────────────────────────────────────────
-# 6. 單張視覺化
+# 4.5 Cross-Attention CAM (僅適用於 MODE_MULTI_ATTN)
+#
+#     利用 QUS→Image 的 cross-attention weights 作為熱力圖，
+#     不需要梯度，直接反映「每個 QUS token 關注 B-mode 影像的哪個空間位置」。
+#     49 個空間位置 -> reshape 成 7x7 -> upsample -> 224x224
 # ─────────────────────────────────────────────
-def show_heatmap(
-    img_vis: np.ndarray,
-    cam_map: np.ndarray,
-    pred_pdff: float,
-    true_pdff: float,
-    title: str = "",
-    save_path: str | None = None,
-):
-    overlay = show_cam_on_image(img_vis, cam_map, use_rgb=True)
+def get_qus_token_names(num_qus_types):
+    names = ["TAI", "TSI"]
+    if num_qus_types >= 3:
+        names.append("SWE")
+    if num_qus_types >= 4:
+        names.append("EzHRI")
+    return names[:num_qus_types]
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+def compute_crossattn_cam(model, img_tensor, qus_tensor, device):
+    """
+    回傳每個 QUS token 對應的空間注意力熱力圖 (已 upsample 到 224x224，正規化到 [0,1])
+
+    Returns
+    -------
+    cam_list : list of np.ndarray，每個 shape [224, 224]，順序對應 get_qus_token_names()
+    """
+    model.eval()
+    img_tensor = img_tensor.to(device)
+    if qus_tensor.dim() == 1:
+        qus_tensor = qus_tensor.unsqueeze(0)
+    qus_tensor = qus_tensor.to(device)
+
+    with torch.no_grad():
+        _, qus2img_attn = model(img_tensor, qus_tensor, return_attn=True)
+        # qus2img_attn: [1, num_qus_types, 49]
+
+    attn = qus2img_attn[0].detach().cpu().numpy()  # [num_qus_types, 49]
+    num_qus_types = attn.shape[0]
+    print(f"num_qus_types is {num_qus_types}")
+    cam_list = []
+    for i in range(num_qus_types):
+        spatial = attn[i].reshape(7, 7)  # [7, 7]
+        # 正規化到 [0, 1]（每個 token 各自正規化，方便比較相對熱區）
+        spatial = spatial - spatial.min()
+        denom = spatial.max()
+        if denom > 1e-8:
+            spatial = spatial / denom
+        heatmap = cv2.resize(spatial, (224, 224), interpolation=cv2.INTER_LINEAR)
+        cam_list.append(heatmap.astype(np.float32))
+
+    return cam_list
+
+
+def show_crossattn_cam(img_vis, cam_list, qus_token_names, pred=None, true_val=None, save_path=None):
+    """
+    並排顯示：原圖 + 每個 QUS token 的 cross-attention 熱力圖
+    """
+    n = len(cam_list)
+    fig, axes = plt.subplots(1, n + 1, figsize=(4 * (n + 1), 4))
+
     axes[0].imshow(img_vis[..., 0], cmap="gray")
-    axes[0].set_title(f"Original  True: {true_pdff*100:.1f}%")
+    title0 = "Original"
+    if true_val is not None:
+        title0 += f"\nTrue: {true_val*100:.1f}%"
+    if pred is not None:
+        title0 += f"\nPred: {pred*100:.1f}%"
+    axes[0].set_title(title0)
     axes[0].axis("off")
 
-    axes[1].imshow(overlay)
-    axes[1].set_title(f"Grad-CAM  Pred: {pred_pdff*100:.1f}%  {title}")
-    axes[1].axis("off")
+    for i, (cam, name) in enumerate(zip(cam_list, qus_token_names)):
+        overlay = show_cam_on_image(img_vis, cam, use_rgb=True)
+        axes[i + 1].imshow(overlay)
+        axes[i + 1].set_title(f"{name} → Image\n(Cross-Attn)")
+        axes[i + 1].axis("off")
 
     plt.tight_layout()
-    # if save_path:
-    #     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    #     plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        # print(f"Saved → {save_path}")
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved → {save_path}")
     plt.show()
-    plt.close()
 
 
-# ─────────────────────────────────────────────
-# 7. 對比兩張熱力圖（Normal QUS vs Extreme QUS）
-# ─────────────────────────────────────────────
-def compare_heatmaps(
-    img_vis: np.ndarray,
-    cam_a: np.ndarray,
-    cam_b: np.ndarray,
-    pred_a: float | None = None,
-    pred_b: float | None = None,
-    label_a: str = "Normal QUS",
-    label_b: str = "Extreme QUS",
-    save_path: str | None = None,
-):
+def compare_crossattn_cam(img_vis, cam_list_a, cam_list_b, qus_token_names,
+                          pred_a=None, pred_b=None,
+                          label_a="Normal QUS", label_b="Extreme QUS",
+                          save_path=None):
     """
-    並排顯示兩張熱力圖及差異圖（cam_b - cam_a）
-
-    Parameters
-    ----------
-    cam_a, cam_b : [224, 224]，值域 [0, 1]
-    pred_a/b     : 對應的模型預測值（小數，如 0.15）；可為 None
+    對比兩種 QUS 輸入下，每個 QUS token 的 cross-attention 熱力圖差異
+    每個 QUS token 一列：[原圖 | Normal heatmap | Extreme heatmap | Diff]
     """
+    n = len(cam_list_a)
+    fig, axes = plt.subplots(n, 4, figsize=(16, 4 * n))
+    if n == 1:
+        axes = axes[None, :]  # 保持 2D 索引一致
+
+    for i, name in enumerate(qus_token_names):
+        cam_a = cam_list_a[i]
+        cam_b = cam_list_b[i]
+        overlay_a = show_cam_on_image(img_vis, cam_a, use_rgb=True)
+        overlay_b = show_cam_on_image(img_vis, cam_b, use_rgb=True)
+        diff = cam_b.astype(np.float32) - cam_a.astype(np.float32)
+
+        axes[i, 0].imshow(img_vis[..., 0], cmap="gray")
+        axes[i, 0].set_title(f"{name}\nOriginal")
+        axes[i, 0].axis("off")
+
+        title_a = label_a if pred_a is None else f"{label_a}\nPred: {pred_a*100:.1f}%"
+        axes[i, 1].imshow(overlay_a)
+        axes[i, 1].set_title(title_a)
+        axes[i, 1].axis("off")
+
+        title_b = label_b if pred_b is None else f"{label_b}\nPred: {pred_b*100:.1f}%"
+        axes[i, 2].imshow(overlay_b)
+        axes[i, 2].set_title(title_b)
+        axes[i, 2].axis("off")
+
+        vmax = max(abs(diff.min()), abs(diff.max())) + 1e-8
+        im = axes[i, 3].imshow(diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        axes[i, 3].set_title("Diff (Extreme − Normal)")
+        axes[i, 3].axis("off")
+        plt.colorbar(im, ax=axes[i, 3], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved → {save_path}")
+    plt.show()
+
+def compare_heatmaps(img_vis, cam_a, cam_b, pred_a=None, pred_b=None, label_a="Normal QUS", label_b="Extreme QUS", save_path=None):
     overlay_a = show_cam_on_image(img_vis, cam_a, use_rgb=True)
     overlay_b = show_cam_on_image(img_vis, cam_b, use_rgb=True)
-
-    # 差異圖：正值表示 extreme QUS 使該區域更受關注
     diff = cam_b.astype(np.float32) - cam_a.astype(np.float32)
 
     fig, axes = plt.subplots(1, 4, figsize=(18, 4))
-    # cv2.imshow("img_vis", img_vis)  # Debug: 查看 img_vis 的內容和範圍
-
-    # 原圖
     axes[0].imshow(img_vis[..., 0], cmap="gray")
     axes[0].set_title("Original")
     axes[0].axis("off")
 
-    # Normal QUS 熱力圖
     title_a = label_a if pred_a is None else f"{label_a}\nPred: {pred_a*100:.1f}%"
     axes[1].imshow(overlay_a)
     axes[1].set_title(title_a)
     axes[1].axis("off")
 
-    # Extreme QUS 熱力圖
     title_b = label_b if pred_b is None else f"{label_b}\nPred: {pred_b*100:.1f}%"
     axes[2].imshow(overlay_b)
     axes[2].set_title(title_b)
     axes[2].axis("off")
 
-    # 差異圖（diverging colormap）
     vmax = max(abs(diff.min()), abs(diff.max())) + 1e-8
     im = axes[3].imshow(diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
     axes[3].set_title("Diff (Extreme − Normal)")
@@ -233,90 +264,107 @@ def compare_heatmaps(
         plt.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"Saved → {save_path}")
     plt.show()
-    plt.close()
-
 
 # ─────────────────────────────────────────────
-# 8. 取得模型預測值（不含梯度）
-# ─────────────────────────────────────────────
-def get_prediction(model, img_tensor, qus_tensor, device):
-    model.eval()
-    with torch.no_grad():
-        img_tensor = img_tensor.to(device)
-        if qus_tensor.dim() == 1:
-            qus_tensor = qus_tensor.unsqueeze(0)
-        pred = model(img_tensor, qus_tensor.to(device)).item()
-
-    return pred
-
-
-# ─────────────────────────────────────────────
-# 9. Main
+# 5. 主程式
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    SAVE_DIR   = "./picture"
-    MODEL_PATH = CONV_MULTI_MODEL_PATH   # 改成你的模型路徑
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    if MODEL_PATH == VGG_MULTI_MODEL_PATH:
-        # pretrained_vgg = models.vgg16(weights='DEFAULT')
-        # model = convModel.MultiModalVGG(pretrained_vgg, num_scalars=NUM_SCALARS)
-        # model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
-        model = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-    elif MODEL_PATH == CONV_MULTI_MODEL_PATH:
+    
+    # --- 動態載入模型與權重 (與 convVal 完全一致的邏輯) ---
+    if CURRENT_MODEL == MODEL_CONVNEXT:
         pretrained_convnext = models.convnext_tiny(weights='DEFAULT')
-        model = convModel.MultiModalConv(pretrained_convnext, num_scalars=NUM_SCALARS)
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+        if CURRENT_MODE == MODE_MULTI:
+            model = convModel.MultiModalConv(pretrained_convnext, num_scalars=NUM_SCALARS)
+        elif CURRENT_MODE == MODE_MULTI_ATTN:
+            model = convModel.MultiModalAttnConv(pretrained_convnext, num_scalars=NUM_SCALARS, num_qus_types=NUM_QUS_TYPES)
+            
+    elif CURRENT_MODEL == MODEL_MEDVIT:
+        pretrained_med = MedViT_small()  
+        pretrained_med.load_state_dict(torch.load(MEDVIT_LOAD_PRETEAINMODEL_PATH), strict=False)
+        if CURRENT_MODE == MODE_MULTI:
+            model = convModel.MultiModalMed(pretrained_med, num_scalars=NUM_SCALARS)
+        elif CURRENT_MODE == MODE_MULTI_ATTN:
+            model = convModel.MultiModalAttnMed(pretrained_med, num_scalars=NUM_SCALARS, num_qus_types=NUM_QUS_TYPES)
+            
+    elif CURRENT_MODEL == MODEL_VGG:
+        pretrained_vgg = models.vgg16(weights='DEFAULT')  
+        if CURRENT_MODE == MODE_MULTI:
+            model = convModel.MultiModalVGG(pretrained_vgg, num_scalars=NUM_SCALARS)
+        elif CURRENT_MODE == MODE_MULTI_ATTN:
+            model = convModel.MultiModalAttnVGG(pretrained_vgg, num_scalars=NUM_SCALARS, num_qus_types=NUM_QUS_TYPES)
+            
+    model.load_state_dict(torch.load(LOAD_MODEL_PATH, map_location=device))
+    model = model.to(device)
     model.eval()
-    print(f"Model: {type(model).__name__}")
+    print(f"Model Loaded: {type(model).__name__} from {LOAD_MODEL_PATH}")
 
-    # ── 選一張驗證集圖片 ──────────────────────────────
+    # --- 讀取圖片 ---
     train_idx, val_idx = convDataset.splits[0]
-    val_list   = convDataset.build_imagelist(
-        val_idx, IMG_FOLDER, MASK_FOLDER,
-        convDataset.labels_reg,
-        convDataset.tai_values,
-        convDataset.tsi_values,
-    )
-    item = val_list[280]   # 取第 0 張；可自行更換
-    # print(f"patient id: {item.patient_id}, true PDFF: {item.value*100:.1f}%")
+    val_list = convDataset.build_imagelist(val_idx)
+    item = val_list[280]   # 可自行更換圖片 idx
     img_tensor, img_vis = preprocess_image(item.imgpath)
 
-    # ── 定義 QUS（支援 10 或 20 個數字）──────────────
-    # 10 個數字（TAI×5 + TSI×5）
-    normal_qus = torch.tensor(
-        list(item.tai) + list(item.tsi),
-        dtype=torch.float32,
-    )
+    # --- 組裝 Normal QUS (動態支援 2, 3, 4 種特徵) ---
+    qus_list = list(item.tai) + list(item.tsi)
+    if NUM_QUS_TYPES >= 3 and item.swe is not None:
+        qus_list += list(item.swe)
+    if NUM_QUS_TYPES >= 4 and item.ezhri is not None:
+        qus_list += list(item.ezhri)
+        
+    normal_qus = torch.tensor(qus_list, dtype=torch.float32)
 
-    # ★ 極端 QUS 由使用者自行修改下面這行 ★
-    extreme_qus = torch.tensor(
-        [0.0] * 5 + [0.0] * 5,   # 範例：全部設為 0
-        dtype=torch.float32,
-    )
+    # --- 極端 QUS (全部填 0 測試) ---
+    extreme_qus = torch.zeros([1.04, 1.04, 1.04, 1.04, 1.04, 99.63, 99.63, 99.63, 99.63, 99.63, 5.97, 5.97, 5.97, 5.97, 5.97, 1.93], dtype=torch.float32)
 
-    # ── 計算熱力圖 ────────────────────────────────────
-    print("Computing Normal QUS Grad-CAM ...")
-    cam_normal  = compute_gradcam(model, img_tensor, normal_qus,  device)
-    pred_normal = get_prediction (model, img_tensor, normal_qus,  device)
+    # --- 計算並畫圖 ---
+    if CURRENT_MODE == MODE_MULTI_ATTN:
+        # ★ 使用 Cross-Attention Weights 作為 CAM（不需要梯度）
+        print("Computing Cross-Attention CAM (Normal QUS) ...")
+        cam_list_normal = compute_crossattn_cam(model, img_tensor, normal_qus, device)
+        pred_normal = get_prediction(model, img_tensor, normal_qus, device)
 
-    print("Computing Extreme QUS Grad-CAM ...")
-    cam_extreme  = compute_gradcam(model, img_tensor, extreme_qus, device)
-    pred_extreme = get_prediction (model, img_tensor, extreme_qus, device)
+        print("Computing Cross-Attention CAM (Extreme QUS) ...")
+        cam_list_extreme = compute_crossattn_cam(model, img_tensor, extreme_qus, device)
+        pred_extreme = get_prediction(model, img_tensor, extreme_qus, device)
 
-    print(f"True PDFF   : {item.value*100:.1f}%")
-    print(f"Pred Normal : {pred_normal*100:.1f}%")
-    print(f"Pred Extreme: {pred_extreme*100:.1f}%")
+        print(f"True PDFF   : {item.value*100:.1f}%")
+        print(f"Pred Normal : {pred_normal*100:.1f}%")
+        print(f"Pred Extreme: {pred_extreme*100:.1f}%")
 
-    # ── 對比顯示 ─────────────────────────────────────
-    compare_heatmaps(
-        img_vis,
-        cam_normal, 
-        cam_extreme,
-        pred_a=pred_normal,
-        pred_b=pred_extreme,
-        label_a="Normal QUS",
-        label_b="Extreme QUS",
-        save_path=os.path.join(SAVE_DIR, "convGradcam.png"),
-    )
+        qus_token_names = get_qus_token_names(NUM_QUS_TYPES)
+
+        # 單獨顯示 Normal QUS 的各 token 熱力圖
+        show_crossattn_cam(
+            img_vis, cam_list_normal, qus_token_names,
+            pred=pred_normal, true_val=item.value,
+            save_path=f"./picture/crossattn_cam_{CURRENT_MODEL}_normal.png",
+        )
+
+        # Normal vs Extreme 對比
+        compare_crossattn_cam(
+            img_vis, cam_list_normal, cam_list_extreme, qus_token_names,
+            pred_a=pred_normal, pred_b=pred_extreme,
+            save_path=f"./picture/crossattn_cam_{CURRENT_MODEL}_compare.png",
+        )
+
+    else:
+        # ★ 一般 Grad-CAM（MODE_MULTI，無 cross-attention）
+        print("Computing Normal QUS Grad-CAM ...")
+        cam_normal  = compute_gradcam(model, img_tensor, normal_qus,  device)
+        pred_normal = get_prediction(model, img_tensor, normal_qus,  device)
+
+        print("Computing Extreme QUS Grad-CAM ...")
+        cam_extreme  = compute_gradcam(model, img_tensor, extreme_qus, device)
+        pred_extreme = get_prediction(model, img_tensor, extreme_qus, device)
+
+        print(f"True PDFF   : {item.value*100:.1f}%")
+        print(f"Pred Normal : {pred_normal*100:.1f}%")
+        print(f"Pred Extreme: {pred_extreme*100:.1f}%")
+
+        compare_heatmaps(
+            img_vis, cam_normal, cam_extreme,
+            pred_a=pred_normal, pred_b=pred_extreme,
+            save_path=f"./picture/gradcam_{CURRENT_MODEL}_{CURRENT_MODE}.png",
+        )
