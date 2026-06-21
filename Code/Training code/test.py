@@ -1,7 +1,7 @@
 import numpy as np
 import convDataset
 
-def main():
+def tenHighestPDFFPatient():
     print("\n" + "*"*60)
     print(" 🏥 脂肪肝最嚴重病患 (Top 10) 數值分析")
     print("*"*60)
@@ -88,5 +88,7 @@ def main():
     print(f"   ➤ EZHRI總平均: {np.mean(ezhri_means):.2f}")
     print("=" * 75 + "\n")
 
+
 if __name__ == "__main__":
-    main()
+    tenHighestPDFFPatient()
+

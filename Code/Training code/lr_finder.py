@@ -57,18 +57,29 @@ def prepare_dataloader(fold, batch_size):
     
     # 修正呼叫方式，配合最新版的 build_imagelist
     train_list = convDataset.build_imagelist(train_idx)
-    train_ds = convDataset.PDFFDataset(train_list, isTrain=True)
     
+
+    class_weight_dict = {cls: 1.0 / count    for cls, count in zip(*np.unique(convDataset.labels_cls[train_idx], return_counts=True))}
+    epoch_train_list = convDataset.sample_per_patient(train_list, N_PER_PATIENT_PER_EPOCH)
+    train_ds = convDataset.PDFFDataset(epoch_train_list, isTrain=True)
     train_image_targets = np.array([item.pdffClass for item in train_ds.dataList])
-    unique_classes, counts = np.unique(train_image_targets, return_counts=True)
-    class_weight_dict = {}
-    for cls, count in zip(unique_classes, counts):
-        class_weight_dict[cls] = 1.0 / count
     samples_weight = np.array([class_weight_dict[t] for t in train_image_targets])
     samples_weight = torch.from_numpy(samples_weight).double()
     sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,shuffle=False, drop_last=True)
+
+    # ===== 每個病人圖片數量不同時使用
+    # train_ds = convDataset.PDFFDataset(train_list, isTrain=True)
+    # train_image_targets = np.array([item.pdffClass for item in train_ds.dataList])
+    # unique_classes, counts = np.unique(train_image_targets, return_counts=True)
+    # class_weight_dict = {}
+    # for cls, count in zip(unique_classes, counts):
+    #     class_weight_dict[cls] = 1.0 / count
+    # samples_weight = np.array([class_weight_dict[t] for t in train_image_targets])
+    # samples_weight = torch.from_numpy(samples_weight).double()
+    # sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
     print(f"sampler len is {len(sampler)}")
-    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, shuffle=False, drop_last=True)
+    # train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, shuffle=False, drop_last=True)
 
     return train_loader, len(train_ds)
 

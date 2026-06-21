@@ -20,15 +20,17 @@ import convVal
 from MedViT import MedViT_small 
 
 
+
 if __name__ == "__main__":
     # 5 fold training
     for fold, (train_idx, val_idx) in enumerate(convDataset.splits, start=1):
-        print(f"\n=== Fold {fold}/5 ===")
-        if fold>1:
-            continue
-        current_time = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        print(f"\n=== Fold {fold}/5  (Model={CURRENT_MODEL}, Mode={CURRENT_MODE}) ===")
+
+        current_time = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{CURRENT_MODEL}-{CURRENT_MODE}-{NUM_QUS_TYPES}-{SEGMENT_STR}"
         log_dir = os.path.join("./outcome", current_time)
         tb_writer = SummaryWriter(log_dir=log_dir)
+        # ★ 每折的模型存檔路徑需各自獨立，否則 5 折會互相覆蓋同一個檔案
+        fold_save_model_path = SAVE_MODEL_PATH.replace(".pth", f"_fold{fold}.pth")
 
         # 1. 讀取資料、建立 Dataset 和 DataLoader
         train_list = convDataset.build_imagelist(train_idx)
@@ -37,17 +39,22 @@ if __name__ == "__main__":
         train_ds = convDataset.PDFFDataset(train_list, isTrain=True)  
         val_ds   = convDataset.PDFFDataset(val_list, isTrain=False)
 
-        train_image_targets = [item.pdffClass for item in train_ds.dataList] 
-        train_image_targets = np.array(train_image_targets)
-        unique_classes, counts = np.unique(train_image_targets, return_counts=True)
-        class_weight_dict = {}
-        for cls, count in zip(unique_classes, counts):
-            class_weight_dict[cls] = 1.0 / count
-        samples_weight = np.array([class_weight_dict[t] for t in train_image_targets])
-        samples_weight = torch.from_numpy(samples_weight).double()
-        sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
+        # ===== 病人內抽樣
+        class_weight_dict = {cls: 1.0 / count    for cls, count in zip(*np.unique(convDataset.labels_cls[train_idx], return_counts=True))}
+        # print("Class weight (fixed for all epochs):", class_weight_dict)
+        # ===== 每個病人圖片數量不同時使用
+        # train_image_targets = [item.pdffClass for item in train_ds.dataList] 
+        # train_image_targets = np.array(train_image_targets)
+        # unique_classes, counts = np.unique(train_image_targets, return_counts=True)
+        # class_weight_dict = {}
+        # for cls, count in zip(unique_classes, counts):
+        #     class_weight_dict[cls] = 1.0 / count
+        # samples_weight = np.array([class_weight_dict[t] for t in train_image_targets])
+        # samples_weight = torch.from_numpy(samples_weight).double()
+        # sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
+        # train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, shuffle=False, drop_last=True)
 
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, shuffle=False, drop_last=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
         val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False)
 
 
@@ -105,6 +112,17 @@ if __name__ == "__main__":
         best_mae = float('inf')  # 初始設為無限大
         counter = 0                   # 計數器
         for epoch in range(NUM_EPOCHS):
+            # ===== 【病人內抽樣】每個 epoch 開始時，重新從 train_list 抽取固定張數 =====
+            epoch_train_list = convDataset.sample_per_patient(train_list, N_PER_PATIENT_PER_EPOCH)
+            train_ds = convDataset.PDFFDataset(epoch_train_list, isTrain=True)
+            if epoch == 0:
+                print(f"Train imgs: {len(train_ds)}") 
+            train_image_targets = np.array([item.pdffClass for item in train_ds.dataList])
+            samples_weight = np.array([class_weight_dict[t] for t in train_image_targets])
+            samples_weight = torch.from_numpy(samples_weight).double()
+            sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
+            train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,shuffle=False, drop_last=True)
+
             # ===== 訓練狀態 =====
             multi_model.train()
             sum_errors = 0.0      # sum of squared errors
@@ -164,14 +182,14 @@ if __name__ == "__main__":
             # ===== 驗證 =====
             cm, mae, overall_acc, final_preds, final_targets, image_val_loss, patient_val_loss, img_acc, img_mae, img_cm = convVal.evaluate_patient_level(
                 multi_model, val_loader, criterion, device)
-            print(f"Epoch {epoch+1}/{NUM_EPOCHS}, patient-level MAE: {mae:.6f}, image_val_loss: {image_val_loss:.6f}, learning rate: {optimizer.param_groups[0]['lr']:.6e}")
+            print(f"Epoch {epoch+1}/{NUM_EPOCHS}, patient-level MAE: {mae:.6f}, learning rate: {optimizer.param_groups[0]['lr']:.6e}")
             # --- Early Stopping 邏輯 ---
             if epoch>=UN_FREEZE_EPOCH:  # 給模型一些時間適應新的權重，前面的epoch不早停
                 if mae < best_mae:
                     best_mae = mae
                     counter = 0  # 重置計數器
                     # [關鍵] 只在變好時存檔，這樣留下來的一定是最好的
-                    torch.save(multi_model.state_dict(), SAVE_MODEL_PATH)
+                    # torch.save(multi_model.state_dict(), SAVE_MODEL_PATH)
                 else:
                     counter += 1
                     if counter >= EARLY_STOPPING_PATIENCE:
@@ -204,5 +222,7 @@ if __name__ == "__main__":
             tb_writer.add_scalar('Loss/val_image', image_val_loss, epoch)
             tb_writer.add_scalar('Loss/val_patient', patient_val_loss, epoch)
             tb_writer.add_scalar('Loss/val_patient_mae', mae, epoch)
-        
+
+        # ★ 這一折訓練結束，把最佳 patient-level MAE 記錄到共用 CSV
+        log_fold_result(fold, best_mae)
         tb_writer.close()

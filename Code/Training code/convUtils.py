@@ -3,21 +3,25 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr, ttest_1samp
+import csv
+import time
 
 # ==========================================
 # 1. 基礎訓練參數設定 
 # "needs to change for execute"
 # ==========================================
-BATCH_SIZE = 16        
-NUM_EPOCHS = 200         
-NUM_QUS_TYPES = 2       
+BATCH_SIZE = 32        
+NUM_EPOCHS = 200        
+NUM_QUS_TYPES = 2      
 NUM_SCALARS = {2: 10, 3: 15, 4: 16}.get(NUM_QUS_TYPES, 10)
+N_PER_PATIENT_PER_EPOCH = 15   # 每位病人每個 epoch 抽取的圖片張數 (病人內抽樣)
 EARLY_STOPPING_PATIENCE = 30
 UN_FREEZE_EPOCH = 10 
-BASE_LR = 3e-04    
+BASE_LR = 2e-03    
 LR_FACTOR = 0.1     
 WEIGHT_DECAY = 3e-2
 LR_DECAY = False         
+USE_SEGMENT_MASK = False    
 
 # ==========================================
 # 2. 模式與模型常數定義
@@ -30,38 +34,42 @@ MODEL_VGG = "model_vgg"
 MODEL_CONVNEXT = "model_convnext"
 MODEL_MEDVIT = "model_medvit"
 
+SEGMENT_STR = "S" if USE_SEGMENT_MASK is True else "NS"
+
 # "needs to change for execute" 
 CURRENT_MODEL = MODEL_CONVNEXT
-CURRENT_MODE = MODE_MULTI_ATTN
+CURRENT_MODE = MODE_MULTI
 
 
 # ==========================================
 # 3. 路徑動態路由 (Router)
 # ==========================================
-IMG_FOLDER = "./nckuPng/CPng"
-MASK_FOLDER = "./nckuPng/CMask"
+IMG_FOLDER = "./nckuPng/newCPng"
+MASK_FOLDER = "./nckuPng/newCMask"
+LIVER_SEGMENT_FOLDER = "./nckuPng/newPredicted_liver_masks"
 PDFF_FILE  = "./numeric/nckuPdff.txt"
 TAITSI_FILE = "./numeric/nckuTAITSI.txt"
 SWE_FILE = "./numeric/nckuSWE.txt"
 EZHRI_FILE = "./numeric/nckuEzHRI.txt"
 MEDVIT_LOAD_PRETEAINMODEL_PATH = "./MedViT/MedViT_small_im1k.pth"
+FOLD_RESULTS_CSV = "./outcome/fold_results.csv"
 
 # 🌟 核心簡化：使用巢狀字典來管理所有可能組合的存檔路徑
 _MODEL_PATHS = {
     MODEL_VGG: {
         MODE_BASE:       "./outcome/vgg_save_model/vggBase.pth",
-        MODE_MULTI:      f"./outcome/vgg_save_model/vgg{NUM_QUS_TYPES}QUS.pth",
-        MODE_MULTI_ATTN: f"./outcome/vgg_save_model/vggAttn{NUM_QUS_TYPES}QUS.pth",
+        MODE_MULTI:      f"./outcome/vgg_save_model/vgg{NUM_QUS_TYPES}QUS-{SEGMENT_STR}.pth",
+        MODE_MULTI_ATTN: f"./outcome/vgg_save_model/vggAttn{NUM_QUS_TYPES}QUS-{SEGMENT_STR}.pth",
     },
     MODEL_CONVNEXT: {
         MODE_BASE:       "./outcome/conv_save_model/convBase.pth",
-        MODE_MULTI:      f"./outcome/conv_save_model/conv{NUM_QUS_TYPES}QUS.pth",
-        MODE_MULTI_ATTN: f"./outcome/conv_save_model/convAttn{NUM_QUS_TYPES}QUS.pth",
+        MODE_MULTI:      f"./outcome/conv_save_model/conv{NUM_QUS_TYPES}QUS-{SEGMENT_STR}.pth",
+        MODE_MULTI_ATTN: f"./outcome/conv_save_model/convAttn{NUM_QUS_TYPES}QUS-{SEGMENT_STR}.pth",
     },
     MODEL_MEDVIT: {
         MODE_BASE:       "./outcome/medvit_save_model/medvitBase.pth",
-        MODE_MULTI:      f"./outcome/medvit_save_model/med{NUM_QUS_TYPES}QUS.pth",
-        MODE_MULTI_ATTN: f"./outcome/medvit_save_model/medAttn{NUM_QUS_TYPES}QUS.pth",
+        MODE_MULTI:      f"./outcome/medvit_save_model/med{NUM_QUS_TYPES}QUS-{SEGMENT_STR}.pth",
+        MODE_MULTI_ATTN: f"./outcome/medvit_save_model/medAttn{NUM_QUS_TYPES}QUS-{SEGMENT_STR}.pth",
     }
 }
 
@@ -211,3 +219,23 @@ def plot_correlation_scatter(preds, targets, title='Correlation between USFF and
     
     return r_val, p_val
 
+
+def log_fold_result(fold, best_mae, csv_path=FOLD_RESULTS_CSV):
+    """
+    將這一折的最佳 patient-level MAE 連同設定資訊寫入共用 CSV (append 模式)。
+    欄位: model, mode, num_qus_types, use_segment_mask, fold, best_mae, timestamp
+    """
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    file_exists = os.path.isfile(csv_path)
+ 
+    with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["model", "mode", "num_qus_types", "use_segment_mask", "lr_decay"
+                             "fold", "best_mae", "timestamp"])
+        writer.writerow([
+            CURRENT_MODEL, CURRENT_MODE, NUM_QUS_TYPES, USE_SEGMENT_MASK, LR_DECAY,
+            fold, best_mae, time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        ])
+    print(f"[Fold {fold}] 結果已記錄到 {csv_path} (best_mae={best_mae:.6f})")
+    

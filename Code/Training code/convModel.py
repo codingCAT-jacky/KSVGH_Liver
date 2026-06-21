@@ -295,7 +295,7 @@ class MultiModalVGG(nn.Module):
         self.image_extractor = pretrained_vgg
 
         self.scalar_norm = nn.BatchNorm1d(num_scalars)
-
+        
         self.fc_features = nn.Sequential(
             nn.Linear(in_features + num_scalars, 512),
             nn.BatchNorm1d(512),

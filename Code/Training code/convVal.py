@@ -18,6 +18,7 @@ import torchvision.models as models
 from scipy.stats import pearsonr
 from MedViT import MedViT_small 
 
+
 def create_optimizer_vgg(model, requires_grad, T_max):
     for param in model.image_extractor.parameters():
         param.requires_grad = requires_grad
@@ -222,6 +223,10 @@ def evaluate_patient_level(model, val_loader, criterion, device):
     return cm, mae, overall_acc, final_preds_np, final_targets_np, image_val_loss, patient_val_loss, image_acc, image_mae, image_cm
 
 
+# # 直接讀取被鎖定的 20% 獨立測試集病人清單
+# test_list = convDataset.build_imagelist(convDataset.test_idx, isTrain=False)
+# test_ds   = convDataset.PDFFDataset(test_list, isTrain=False)
+# test_loader = DataLoader(test_ds, batch_size=32, shuffle=False)
 
 if __name__ == "__main__":
     # 取第一組分割；可自行更換
@@ -232,16 +237,16 @@ if __name__ == "__main__":
     val_list   = convDataset.build_imagelist(val_idx)
     train_ds = convDataset.PDFFDataset(train_list, isTrain=True)  # 你的 Dataset
     val_ds   = convDataset.PDFFDataset(val_list, isTrain=False)
-    train_image_targets = [item.pdffClass for item in train_ds.dataList] 
-    train_image_targets = np.array(train_image_targets)
-    unique_classes, counts = np.unique(train_image_targets, return_counts=True)
-    class_weight_dict = {}
-    for cls, count in zip(unique_classes, counts):
-        class_weight_dict[cls] = 1.0 / count
-    samples_weight = np.array([class_weight_dict[t] for t in train_image_targets])
-    samples_weight = torch.from_numpy(samples_weight).double()
-    sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
-    train_loader = DataLoader(train_ds, batch_size=32, sampler=sampler, shuffle=False, drop_last=True)
+    # train_image_targets = [item.pdffClass for item in train_ds.dataList] 
+    # train_image_targets = np.array(train_image_targets)
+    # unique_classes, counts = np.unique(train_image_targets, return_counts=True)
+    # class_weight_dict = {}
+    # for cls, count in zip(unique_classes, counts):
+    #     class_weight_dict[cls] = 1.0 / count
+    # samples_weight = np.array([class_weight_dict[t] for t in train_image_targets])
+    # samples_weight = torch.from_numpy(samples_weight).double()
+    # sampler = WeightedRandomSampler(samples_weight, len(samples_weight), replacement=True)
+    # train_loader = DataLoader(train_ds, batch_size=32, sampler=sampler, shuffle=False, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=32, shuffle=False)
     print(f"Train imgs: {len(train_ds)} | Val imgs: {len(val_ds)}")
     print("Train dist:", count_by_class(train_idx, convDataset.labels_cls))
@@ -278,9 +283,12 @@ if __name__ == "__main__":
         elif CURRENT_MODE == MODE_MULTI_ATTN:
             multi_model = convModel.MultiModalAttnVGG(pretrained_vgg, num_scalars=NUM_SCALARS, num_qus_types=NUM_QUS_TYPES)
     # 👇 只需要在這裡寫一次 load，它會自動去 utils 抓對應的字典路徑！
-    multi_model.load_state_dict(torch.load(LOAD_MODEL_PATH, map_location=device))
+    if CURRENT_MODEL==MODEL_CONVNEXT and CURRENT_MODE==MODE_BASE:
+        print("asdf")
+        multi_model = torch.load("./outcome/conv_save_model/convBase.pth", map_location=device, weights_only=False)
+    else:
+        multi_model.load_state_dict(torch.load(LOAD_MODEL_PATH, map_location=device))
     multi_model = multi_model.to(device)
-    # elif CURRENT_MODEL == MODEL_MEDVIT:
     criterion = nn.MSELoss()
 
 
@@ -382,3 +390,4 @@ if __name__ == "__main__":
     plot_bland_altman(val_preds, val_targets, title="Validation Bland-Altman Plot", filename="./picture/convVal_bland_altman.png")
     plot_correlation_scatter(val_preds, val_targets, title="Correlation between Prediction and MRI-PDFF", filename="./picture/convVal_correlation.png")
     print("\n✅ 所有結果輸出完畢，並已存下 Validation 的 Confusion Matrix 圖片！")
+

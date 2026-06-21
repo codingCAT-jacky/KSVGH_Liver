@@ -26,28 +26,39 @@ class PDFFRegressionTarget:
         return output[0]
 
 class MultiModalWrapper(nn.Module):
-    def __init__(self, model, fixed_qus: torch.Tensor):
+    """
+    用於 GradCAM：固定 QUS 輸入，只暴露 img 給 pytorch-grad-cam。
+    強制 return_attn=False（即使是 MODE_MULTI_ATTN 模型），確保 forward 只回傳
+    [B,1] 的純量 tensor，符合 GradCAM 對 model 輸出格式的要求。
+    """
+    def __init__(self, model, fixed_qus: torch.Tensor, is_attn_model: bool = False):
         super().__init__()
         self.model = model
         self.fixed_qus = fixed_qus
+        self.is_attn_model = is_attn_model
 
     def forward(self, img):
+        if self.is_attn_model:
+            return self.model(img, self.fixed_qus, return_attn=False)
         return self.model(img, self.fixed_qus)
 
 # ─────────────────────────────────────────────
 # 2. 智慧尋找 Target Layer
 # ─────────────────────────────────────────────
 def get_target_layer(model):
-    """根據不同 Backbone 結構動態尋找最後一個卷積層作為 CAM 的 Target"""
+    """
+    根據不同 Backbone 結構動態尋找最後一個卷積層作為 CAM 的 Target。
+    MODE_MULTI 與 MODE_MULTI_ATTN 的影像分支屬性名稱一致 (image_extractor / backbone)，
+    故不需特別分支，仍依 CURRENT_MODEL 判斷即可。
+    """
     if CURRENT_MODEL == MODEL_CONVNEXT:
-        # ConvNeXt 的 features 模組最後一塊
-        return model.image_extractor.features[-1]
+        # ConvNeXt 的 features 模組最後一塊 (MODE_MULTI / MODE_MULTI_ATTN 皆同名)
+        return model.image_extractor[-1] if CURRENT_MODE == MODE_MULTI_ATTN else model.image_extractor.features[-1]
     elif CURRENT_MODEL == MODEL_VGG:
         # VGG features 的最後一層通常是 MaxPool，我們取倒數第二層 Conv2d (index 28)
-        # 在 MultiModalAttnVGG 中它是放在 image_extractor 中
         return model.image_extractor[28]
     elif CURRENT_MODEL == MODEL_MEDVIT:
-        # MedViT 的空間特徵是從 norm 輸出的
+        # MedViT 的空間特徵是從 norm 輸出的 (MODE_MULTI / MODE_MULTI_ATTN 皆同名)
         return model.backbone.norm
     else:
         raise ValueError("Unknown Target Layer for Current Model")
@@ -82,13 +93,19 @@ def preprocess_image(img_path: str):
 # 4. 運算與繪圖邏輯
 # ─────────────────────────────────────────────
 def compute_gradcam(model, img_tensor, qus_tensor, device):
+    """
+    一般 Grad-CAM。同時支援 MODE_MULTI 與 MODE_MULTI_ATTN 模型：
+    對於 Attn 模型，forward 時強制 return_attn=False，確保輸出為單一 [B,1] tensor，
+    這樣 Grad-CAM 才能對它做反向傳播。
+    """
     model.eval()
     img_tensor = img_tensor.to(device)
 
     if qus_tensor.dim() == 1:
         qus_tensor = qus_tensor.unsqueeze(0)
-        
-    cam_model = MultiModalWrapper(model, qus_tensor.to(device)).to(device)
+
+    is_attn_model = (CURRENT_MODE == MODE_MULTI_ATTN)
+    cam_model = MultiModalWrapper(model, qus_tensor.to(device), is_attn_model=is_attn_model).to(device)
     target_layer = get_target_layer(model)
 
     cam = GradCAM(model=cam_model, target_layers=[target_layer])
@@ -140,7 +157,7 @@ def compute_crossattn_cam(model, img_tensor, qus_tensor, device):
 
     attn = qus2img_attn[0].detach().cpu().numpy()  # [num_qus_types, 49]
     num_qus_types = attn.shape[0]
-    print(f"num_qus_types is {num_qus_types}")
+
     cam_list = []
     for i in range(num_qus_types):
         spatial = attn[i].reshape(7, 7)  # [7, 7]
@@ -178,10 +195,10 @@ def show_crossattn_cam(img_vis, cam_list, qus_token_names, pred=None, true_val=N
         axes[i + 1].axis("off")
 
     plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved → {save_path}")
+    # if save_path:
+    #     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    #     plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    #     print(f"Saved → {save_path}")
     plt.show()
 
 
@@ -304,6 +321,7 @@ if __name__ == "__main__":
     train_idx, val_idx = convDataset.splits[0]
     val_list = convDataset.build_imagelist(val_idx)
     item = val_list[280]   # 可自行更換圖片 idx
+    print(f"patient is {item.patient_id}")
     img_tensor, img_vis = preprocess_image(item.imgpath)
 
     # --- 組裝 Normal QUS (動態支援 2, 3, 4 種特徵) ---
@@ -314,24 +332,41 @@ if __name__ == "__main__":
         qus_list += list(item.ezhri)
         
     normal_qus = torch.tensor(qus_list, dtype=torch.float32)
-
+    
     # --- 極端 QUS (全部填 0 測試) ---
-    extreme_qus = torch.zeros([1.04, 1.04, 1.04, 1.04, 1.04, 99.63, 99.63, 99.63, 99.63, 99.63, 5.97, 5.97, 5.97, 5.97, 5.97, 1.93], dtype=torch.float32)
+    extreme_4qus = torch.tensor([1.04, 1.04, 1.04, 1.04, 1.04, 99.63, 99.63, 99.63, 99.63, 99.63, 5.97, 5.97, 5.97, 5.97, 5.97, 1.93], dtype=torch.float32)
+    extreme_3qus = torch.tensor([1.04, 1.04, 1.04, 1.04, 1.04, 99.63, 99.63, 99.63, 99.63, 99.63, 5.97, 5.97, 5.97, 5.97, 5.97], dtype=torch.float32)
+    extreme_2qus = torch.tensor([1.04, 1.04, 1.04, 1.04, 1.04, 99.63, 99.63, 99.63, 99.63, 99.63], dtype=torch.float32)
+    extreme_qus = extreme_2qus
 
+    
     # --- 計算並畫圖 ---
+    # ★ 一般 Grad-CAM：MODE_MULTI 與 MODE_MULTI_ATTN 都支援
+    print("Computing Normal QUS Grad-CAM ...")
+    cam_normal  = compute_gradcam(model, img_tensor, normal_qus,  device)
+    pred_normal = get_prediction(model, img_tensor, normal_qus,  device)
+
+    print("Computing Extreme QUS Grad-CAM ...")
+    cam_extreme  = compute_gradcam(model, img_tensor, extreme_qus, device)
+    pred_extreme = get_prediction(model, img_tensor, extreme_qus, device)
+
+    print(f"True PDFF   : {item.value*100:.1f}%")
+    print(f"Pred Normal : {pred_normal*100:.1f}%")
+    print(f"Pred Extreme: {pred_extreme*100:.1f}%")
+
+    compare_heatmaps(
+        img_vis, cam_normal, cam_extreme,
+        pred_a=pred_normal, pred_b=pred_extreme,
+        save_path=f"./picture/gradcam_{CURRENT_MODEL}_{CURRENT_MODE}.png",
+    )
+
+    # ★ Cross-Attention CAM：僅 MODE_MULTI_ATTN 額外提供（細粒度、每個 QUS token 各一張）
     if CURRENT_MODE == MODE_MULTI_ATTN:
-        # ★ 使用 Cross-Attention Weights 作為 CAM（不需要梯度）
-        print("Computing Cross-Attention CAM (Normal QUS) ...")
+        print("\nComputing Cross-Attention CAM (Normal QUS) ...")
         cam_list_normal = compute_crossattn_cam(model, img_tensor, normal_qus, device)
-        pred_normal = get_prediction(model, img_tensor, normal_qus, device)
 
         print("Computing Cross-Attention CAM (Extreme QUS) ...")
         cam_list_extreme = compute_crossattn_cam(model, img_tensor, extreme_qus, device)
-        pred_extreme = get_prediction(model, img_tensor, extreme_qus, device)
-
-        print(f"True PDFF   : {item.value*100:.1f}%")
-        print(f"Pred Normal : {pred_normal*100:.1f}%")
-        print(f"Pred Extreme: {pred_extreme*100:.1f}%")
 
         qus_token_names = get_qus_token_names(NUM_QUS_TYPES)
 
@@ -347,24 +382,4 @@ if __name__ == "__main__":
             img_vis, cam_list_normal, cam_list_extreme, qus_token_names,
             pred_a=pred_normal, pred_b=pred_extreme,
             save_path=f"./picture/crossattn_cam_{CURRENT_MODEL}_compare.png",
-        )
-
-    else:
-        # ★ 一般 Grad-CAM（MODE_MULTI，無 cross-attention）
-        print("Computing Normal QUS Grad-CAM ...")
-        cam_normal  = compute_gradcam(model, img_tensor, normal_qus,  device)
-        pred_normal = get_prediction(model, img_tensor, normal_qus,  device)
-
-        print("Computing Extreme QUS Grad-CAM ...")
-        cam_extreme  = compute_gradcam(model, img_tensor, extreme_qus, device)
-        pred_extreme = get_prediction(model, img_tensor, extreme_qus, device)
-
-        print(f"True PDFF   : {item.value*100:.1f}%")
-        print(f"Pred Normal : {pred_normal*100:.1f}%")
-        print(f"Pred Extreme: {pred_extreme*100:.1f}%")
-
-        compare_heatmaps(
-            img_vis, cam_normal, cam_extreme,
-            pred_a=pred_normal, pred_b=pred_extreme,
-            save_path=f"./picture/gradcam_{CURRENT_MODEL}_{CURRENT_MODE}.png",
         )
